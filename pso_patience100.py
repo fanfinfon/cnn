@@ -1142,13 +1142,10 @@ N_DIMS = len(PSO_SPACE)
 
 
 @ray.remote(num_gpus=1)
-def pso_objective_remote(params, X_raw_data, y_data):
+def pso_objective_remote(params, precomputed_folds):
     import numpy as np
-    import tensorflow as tf
     from tensorflow import keras
-    from sklearn.preprocessing import MinMaxScaler
     from sklearn.metrics import accuracy_score
-    from sklearn.model_selection import StratifiedKFold
     import os
     os.environ['TF_FORCE_GPU_ALLOW_GROWTH'] = 'true'
     
@@ -1160,25 +1157,18 @@ def pso_objective_remote(params, X_raw_data, y_data):
         patience=30, min_lr=1e-5, verbose=0)
         
     f1, f2, ks, dr, du, lr = params
-    skf = StratifiedKFold(n_splits=PSO_SEARCH_FOLDS, shuffle=True, random_state=SEED)
     accs = []
-    for fold, (tr, te) in enumerate(skf.split(X_raw_data, y_data)):
-        np.random.seed(SEED + fold)
-        tf.random.set_seed(SEED + fold)
-        sc = MinMaxScaler()
-        Xtr_s = sc.fit_transform(X_raw_data[tr]).astype(np.float32)
-        Xte_s = sc.transform(X_raw_data[te]).astype(np.float32)
-        Xtr_aug, ytr_aug = augment(Xtr_s, y_data[tr])
+    for fold_data in precomputed_folds:
         cnn = build_cnn(cnn_act='relu', fc_act='relu',
                         filters_1=int(f1), filters_2=int(f2),
                         kernel_size=int(ks), dropout=dr,
                         dense_units=int(du), lr=lr)
-        cnn.fit(Xtr_aug.reshape(-1, N_FEATURES, 1), ytr_aug,
+        cnn.fit(fold_data['X_train'], fold_data['y_train'],
                 validation_split=0.10, epochs=300,
-                batch_size=BATCH_SIZE, callbacks=[ES_local, LR_REDUCE_local], verbose=0)
+                batch_size=256, callbacks=[ES_local, LR_REDUCE_local], verbose=0)
         preds = np.argmax(cnn.predict(
-            Xte_s.reshape(-1, N_FEATURES, 1), verbose=0), axis=1)
-        accs.append(accuracy_score(y_data[te], preds))
+            fold_data['X_test'], verbose=0), axis=1)
+        accs.append(accuracy_score(fold_data['y_test'], preds))
         keras.backend.clear_session()
     return np.mean(accs)
 
@@ -1229,6 +1219,25 @@ print(f'Total planned evaluations: {PSO_PARTICLES * PSO_ITERATIONS}')
 print(f'Checkpoint path: {PSO_CKPT_PATH}')
 print()
 
+print("Precomputing data folds and augmentations for PSO (this happens ONCE)...")
+_skf_pso = StratifiedKFold(n_splits=PSO_SEARCH_FOLDS, shuffle=True, random_state=SEED)
+_pso_folds_local = []
+for _fold, (_tr, _te) in enumerate(_skf_pso.split(X_raw, y)):
+    np.random.seed(SEED + _fold)
+    tf.random.set_seed(SEED + _fold)
+    _sc = MinMaxScaler()
+    _Xtr_s = _sc.fit_transform(X_raw[_tr]).astype(np.float32)
+    _Xte_s = _sc.transform(X_raw[_te]).astype(np.float32)
+    _Xtr_aug, _ytr_aug = augment(_Xtr_s, y[_tr])
+    _pso_folds_local.append({
+        'X_train': _Xtr_aug.reshape(-1, N_FEATURES, 1),
+        'y_train': _ytr_aug,
+        'X_test': _Xte_s.reshape(-1, N_FEATURES, 1),
+        'y_test': y[_te]
+    })
+pso_folds_id = ray.put(_pso_folds_local)
+print("Precomputation complete!")
+
 # ray.init and object references moved to imports section
 
 pbar = tqdm(range(start_iter, PSO_ITERATIONS), desc="PSO Search Iterations")
@@ -1236,7 +1245,7 @@ for it in pbar:
     futures = []
     for p in range(PSO_PARTICLES):
         params = snap(positions[p])
-        futures.append(pso_objective_remote.remote(params, X_raw_id, y_id))
+        futures.append(pso_objective_remote.remote(params, pso_folds_id))
         
     _it0 = time.time()
     results = ray.get(futures)
