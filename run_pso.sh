@@ -108,7 +108,7 @@ fi
 
 # 3. Test if Docker is correctly configured to pass GPUs to containers
 log "Testing Docker GPU access..."
-if ! $DOCKER_CMD run --rm --gpus all nvcr.io/nvidia/tensorflow:24.03-tf2-py3 nvidia-smi > /dev/null 2>&1; then
+if ! $DOCKER_CMD run --rm --gpus all nvcr.io/nvidia/tensorflow:24.03-tf2-py3 nvidia-smi; then
     error "Docker cannot access the GPUs. The NVIDIA Container Toolkit might be misconfigured, or the Docker daemon needs a restart (sudo systemctl restart docker)."
 fi
 
