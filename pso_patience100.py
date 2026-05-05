@@ -1262,9 +1262,15 @@ for it in pbar:
             
     pso_log.append({'iter': it+1, 'gbest': gbest_val,
                     'params': snap(gbest_pos)})
-    msg2 = f'  >> Iter {it+1} best: {gbest_val:.3f} — {dict(zip(PARAM_NAMES, snap(gbest_pos)))} (Time: {_it_time:.1f}s)'
+    
+    rem_iters = PSO_ITERATIONS - (it + 1)
+    eta_sec = rem_iters * _it_time
+    eta_str = time.strftime('%H:%M:%S', time.gmtime(eta_sec))
+    
+    msg2 = f'  >> Iter {it+1}/{PSO_ITERATIONS} best: {gbest_val:.3f} — {dict(zip(PARAM_NAMES, snap(gbest_pos)))} (Time: {_it_time:.1f}s, ETA: {eta_str})'
+    print(msg2)
     logging.info(msg2)
-    pbar.set_postfix({'Best Acc': f"{gbest_val:.3f}"})
+    pbar.set_postfix({'Best Acc': f"{gbest_val:.3f}", 'ETA': eta_str})
 
     pd.DataFrame(pso_log).to_csv(PSO_LOG_CSV, index=False)
 
