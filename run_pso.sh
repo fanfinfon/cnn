@@ -66,7 +66,30 @@ if ! docker ps >/dev/null 2>&1; then
 fi
 
 # ==========================================
-# 4. Start the Training
+# 4. Verify Host GPU Health & Docker GPU Access
+# ==========================================
+log "Verifying host GPU health..."
+
+# 1. Check if NVIDIA driver is installed (nvidia-smi exists)
+if ! command -v nvidia-smi > /dev/null 2>&1; then
+    error "nvidia-smi not found. The NVIDIA driver is not installed on the host OS."
+fi
+
+# 2. Check if GPU is visible and driver is healthy at host level
+if ! nvidia-smi > /dev/null 2>&1; then
+    error "nvidia-smi execution failed. The GPU is not visible to the system, or the host NVIDIA driver/CUDA stack is broken."
+fi
+
+# 3. Test if Docker is correctly configured to pass GPUs to containers
+log "Testing Docker GPU access..."
+if ! $DOCKER_CMD run --rm --gpus all nvcr.io/nvidia/tensorflow:24.03-tf2-py3 nvidia-smi > /dev/null 2>&1; then
+    error "Docker cannot access the GPUs. The NVIDIA Container Toolkit might be misconfigured, or the Docker daemon needs a restart (sudo systemctl restart docker)."
+fi
+
+log "GPU health checks passed successfully!"
+
+# ==========================================
+# 5. Start the Training
 # ==========================================
 # Stop and remove any existing container with the same name
 # Use || true so the script doesn't fail if the container doesn't exist
