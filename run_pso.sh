@@ -4,6 +4,12 @@
 # treat unset variables as an error, and fail on pipeline errors.
 set -euo pipefail
 
+# Ensure we check common paths where nvidia-smi might be hiding
+export PATH="/usr/local/nvidia/bin:/opt/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
+
+# Prevent apt from prompting for user input during auto-installs
+export DEBIAN_FRONTEND=noninteractive
+
 # ==========================================
 # 0. Helper Functions
 # ==========================================
@@ -70,9 +76,26 @@ fi
 # ==========================================
 log "Verifying host GPU health..."
 
-# 1. Check if NVIDIA driver is installed (nvidia-smi exists)
+# 1. Check if NVIDIA driver is installed (nvidia-smi exists). If not, Auto-Install!
 if ! command -v nvidia-smi > /dev/null 2>&1; then
-    error "nvidia-smi not found. The NVIDIA driver is not installed on the host OS."
+    log "nvidia-smi not found. Attempting to automatically install NVIDIA host drivers..."
+    
+    if command -v apt-get > /dev/null 2>&1; then
+        sudo apt-get update
+        sudo apt-get install -y ubuntu-drivers-common
+        log "Running ubuntu-drivers autoinstall (This may take a few minutes)..."
+        sudo ubuntu-drivers autoinstall
+        
+        # Dynamically load the kernel module so we don't require a reboot
+        sudo modprobe nvidia || log "Warning: Could not dynamically load 'nvidia' module. A reboot might be required."
+        
+        if ! command -v nvidia-smi > /dev/null 2>&1; then
+            error "Auto-installation finished, but nvidia-smi is still not available. A reboot might be necessary, or the installation failed."
+        fi
+        log "NVIDIA host drivers installed successfully!"
+    else
+        error "nvidia-smi not found. Auto-install is only supported on apt-based systems. Please install the NVIDIA driver manually."
+    fi
 fi
 
 # 2. Check if GPU is visible and driver is healthy at host level
