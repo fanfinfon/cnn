@@ -450,6 +450,11 @@ CLASS_NAMES = list(le.classes_)
 print(f'X shape : {X_raw.shape}')
 print(f'Classes : {le.classes_}  Per-class: {np.bincount(y)}')
 
+import ray
+ray.init(num_gpus=3, ignore_reinit_error=True)
+X_raw_id = ray.put(X_raw)
+y_id = ray.put(y)
+
 
 # In[14]:
 
@@ -510,6 +515,42 @@ def augment(X, y_arr, noise_std=0.02, copies=2):
     return np.vstack(parts_X), np.concatenate(parts_y)
 
 
+@ray.remote(num_gpus=1)
+def _cv_cnn_fold_remote(fold, tr, te, X_raw_data, y_data, cnn_act, fc_act, collect_history, collect_preds, seed, max_epochs, batch_size):
+    import numpy as np
+    import tensorflow as tf
+    from tensorflow import keras
+    from tensorflow.keras import backend as K
+    from sklearn.preprocessing import MinMaxScaler
+    from sklearn.metrics import accuracy_score
+    import os
+    os.environ['TF_FORCE_GPU_ALLOW_GROWTH'] = 'true'
+    
+    np.random.seed(seed + fold)
+    tf.random.set_seed(seed + fold)
+    sc    = MinMaxScaler()
+    Xtr_s = sc.fit_transform(X_raw_data[tr]).astype(np.float32)
+    Xte_s = sc.transform(X_raw_data[te]).astype(np.float32)
+    Xtr_aug, ytr_aug = augment(Xtr_s, y_data[tr])
+    m = build_cnn(cnn_act=cnn_act, fc_act=fc_act)
+    ES_local = keras.callbacks.EarlyStopping(
+        monitor='val_accuracy', patience=80,
+        restore_best_weights=True, verbose=0)
+    LR_REDUCE_local = keras.callbacks.ReduceLROnPlateau(
+        monitor='val_accuracy', factor=0.5,
+        patience=30, min_lr=1e-5, verbose=0)
+        
+    hist = m.fit(Xtr_aug.reshape(-1, N_FEATURES, 1), ytr_aug,
+                 validation_split=0.10, epochs=max_epochs,
+                 batch_size=batch_size, callbacks=[ES_local, LR_REDUCE_local], verbose=0)
+                 
+    history_val = hist.history['val_accuracy'] if collect_history else None
+    preds = np.argmax(m.predict(Xte_s.reshape(-1, N_FEATURES, 1), verbose=0), axis=1)
+    acc = round(accuracy_score(y_data[te], preds), 3)
+    K.clear_session()
+    
+    return acc, (y_data[te] if collect_preds else None), (preds if collect_preds else None), history_val
+
 def cv_cnn_softmax(cnn_act='relu', fc_act='linear', label='',
                    collect_preds=False, collect_history=False):
     if not label: label = f'CNN-Softmax {cnn_act}+{fc_act}'
@@ -517,27 +558,22 @@ def cv_cnn_softmax(cnn_act='relu', fc_act='linear', label='',
     _t0 = time.time()
     skf = StratifiedKFold(n_splits=N_SPLITS, shuffle=True, random_state=SEED)
     accs, all_true, all_pred, fold_histories = [], [], [], []
+    
+    futures = []
     for fold, (tr, te) in enumerate(skf.split(X_raw, y)):
-        np.random.seed(SEED + fold)
-        tf.random.set_seed(SEED + fold)
-        sc    = MinMaxScaler()
-        Xtr_s = sc.fit_transform(X_raw[tr]).astype(np.float32)
-        Xte_s = sc.transform(X_raw[te]).astype(np.float32)
-        Xtr_aug, ytr_aug = augment(Xtr_s, y[tr])
-        m = build_cnn(cnn_act=cnn_act, fc_act=fc_act)
-        hist = m.fit(Xtr_aug.reshape(-1, N_FEATURES, 1), ytr_aug,
-                     validation_split=0.10, epochs=MAX_EPOCHS,
-                     batch_size=BATCH_SIZE, callbacks=[ES, LR_REDUCE], verbose=0)
-        if collect_history:
-            fold_histories.append(hist.history['val_accuracy'])
-        preds = np.argmax(m.predict(
-            Xte_s.reshape(-1, N_FEATURES, 1), verbose=0), axis=1)
-        acc = round(accuracy_score(y[te], preds), 3)
+        futures.append(_cv_cnn_fold_remote.remote(fold, tr, te, X_raw_id, y_id, cnn_act, fc_act, collect_history, collect_preds, SEED, MAX_EPOCHS, BATCH_SIZE))
+        
+    results = ray.get(futures)
+    for fold, res in enumerate(results):
+        acc, t_labels, p_labels, history_val = res
         accs.append(acc)
         if collect_preds:
-            all_true.extend(y[te]); all_pred.extend(preds)
+            all_true.extend(t_labels)
+            all_pred.extend(p_labels)
+        if collect_history:
+            fold_histories.append(history_val)
         print(f'  Fold {fold+1:2d}: {acc:.3f}')
-        K.clear_session()
+        
     _elapsed = time.time() - _t0
     TIMING[label] = _elapsed
     print(f'  -- Average: {np.mean(accs):.3f}  |  Time: {_elapsed:.1f}s ({_elapsed/60:.1f} min)')
@@ -551,27 +587,109 @@ def cv_cnn_softmax(cnn_act='relu', fc_act='linear', label='',
     return accs
 
 
+@ray.remote(num_cpus=1)
+def _cv_svm_fold_remote(fold, tr, te, X_raw_data, y_data, seed):
+    import numpy as np
+    from sklearn.preprocessing import MinMaxScaler
+    from sklearn.metrics import accuracy_score
+    from sklearn.svm import SVC
+    
+    np.random.seed(seed + fold)
+    sc  = MinMaxScaler()
+    clf = SVC(kernel='rbf', random_state=seed)
+    clf.fit(sc.fit_transform(X_raw_data[tr]), y_data[tr])
+    preds = clf.predict(sc.transform(X_raw_data[te]))
+    acc   = round(accuracy_score(y_data[te], preds), 3)
+    return acc, (y_data[te] if True else None), (preds if True else None)
+
 def cv_svm(collect_preds=False):
     print('\n[SVM - RBF kernel]')
     _t0 = time.time()
     skf = StratifiedKFold(n_splits=N_SPLITS, shuffle=True, random_state=SEED)
     accs, all_true, all_pred, fold_histories = [], [], [], []
+    
+    futures = []
     for fold, (tr, te) in enumerate(skf.split(X_raw, y)):
-        np.random.seed(SEED + fold)
-        sc  = MinMaxScaler()
-        clf = SVC(kernel='rbf', random_state=SEED)
-        clf.fit(sc.fit_transform(X_raw[tr]), y[tr])
-        preds = clf.predict(sc.transform(X_raw[te]))
-        acc   = round(accuracy_score(y[te], preds), 3)
+        futures.append(_cv_svm_fold_remote.remote(fold, tr, te, X_raw_id, y_id, SEED))
+        
+    results = ray.get(futures)
+    for fold, res in enumerate(results):
+        acc, t_labels, p_labels = res
         accs.append(acc)
         if collect_preds:
-            all_true.extend(y[te]); all_pred.extend(preds)
+            all_true.extend(t_labels)
+            all_pred.extend(p_labels)
         print(f'  Fold {fold+1:2d}: {acc:.3f}')
+        
     print(f'  -- Average: {np.mean(accs):.3f}')
     if collect_preds:
         return accs, np.array(all_true), np.array(all_pred)
     return accs
 
+
+@ray.remote(num_gpus=1)
+def _cv_shared_fold_remote(fold, tr, te, X_raw_data, y_data, cnn_act, k_knn, n_rf, filters_1, filters_2, kernel_size, dropout, dense_units, lr, seed, batch_size):
+    import numpy as np
+    import tensorflow as tf
+    from tensorflow import keras
+    from tensorflow.keras import backend as K
+    from sklearn.preprocessing import MinMaxScaler
+    from sklearn.metrics import accuracy_score
+    from sklearn.svm import SVC
+    from sklearn.ensemble import RandomForestClassifier
+    from sklearn.neighbors import KNeighborsClassifier
+    from xgboost import XGBClassifier
+    import os
+    os.environ['TF_FORCE_GPU_ALLOW_GROWTH'] = 'true'
+    
+    np.random.seed(seed + fold)
+    tf.random.set_seed(seed + fold)
+    sc        = MinMaxScaler()
+    Xtr_s     = sc.fit_transform(X_raw_data[tr]).astype(np.float32)
+    Xte_s     = sc.transform(X_raw_data[te]).astype(np.float32)
+    Xtr_aug, ytr_aug = augment(Xtr_s, y_data[tr])
+    Xtr_aug_r = Xtr_aug.reshape(-1, N_FEATURES, 1)
+    Xtr_r     = Xtr_s.reshape(-1, N_FEATURES, 1)
+    Xte_r     = Xte_s.reshape(-1, N_FEATURES, 1)
+    cnn = build_cnn(cnn_act=cnn_act, fc_act='relu',
+                    filters_1=filters_1, filters_2=filters_2,
+                    kernel_size=kernel_size, dropout=dropout,
+                    dense_units=dense_units, lr=lr)
+    ES_local = keras.callbacks.EarlyStopping(
+        monitor='val_accuracy', patience=80,
+        restore_best_weights=True, verbose=0)
+    LR_REDUCE_local = keras.callbacks.ReduceLROnPlateau(
+        monitor='val_accuracy', factor=0.5,
+        patience=30, min_lr=1e-5, verbose=0)
+        
+    cnn.fit(Xtr_aug_r, ytr_aug, validation_split=0.10,
+            epochs=500, batch_size=batch_size,
+            callbacks=[ES_local, LR_REDUCE_local], verbose=0)
+    ext  = keras.Model(inputs=cnn.input, outputs=cnn.get_layer('fc').output)
+    Ftr  = ext(Xtr_r, training=False).numpy()
+    Fte  = ext(Xte_r, training=False).numpy()
+    K.clear_session()
+    
+    clfs = {
+        'cnn_svm': SVC(kernel='rbf', random_state=seed),
+        'cnn_rf' : RandomForestClassifier(n_estimators=n_rf, random_state=seed, n_jobs=-1),
+        'cnn_knn': KNeighborsClassifier(n_neighbors=k_knn),
+        'cnn_xgb': XGBClassifier(n_estimators=200, learning_rate=0.1,
+                                  max_depth=4, use_label_encoder=False,
+                                  eval_metric='mlogloss', random_state=seed,
+                                  verbosity=0, tree_method='hist', device='cuda'),
+    }
+    
+    fold_accs = {}
+    fold_preds = {}
+    for name, clf in clfs.items():
+        clf.fit(Ftr, y_data[tr])
+        preds = clf.predict(Fte)
+        acc   = round(accuracy_score(y_data[te], preds), 3)
+        fold_accs[name] = acc
+        fold_preds[name] = preds
+        
+    return fold_accs, fold_preds, y_data[te]
 
 def cv_shared_hybrid(cnn_act='relu', k_knn=5, n_rf=200,
                      filters_1=32, filters_2=64, kernel_size=3,
@@ -582,49 +700,27 @@ def cv_shared_hybrid(cnn_act='relu', k_knn=5, n_rf=200,
     _t0 = time.time()
     skf = StratifiedKFold(n_splits=N_SPLITS, shuffle=True, random_state=SEED)
     res = {k: {'accs':[],'true':[],'pred':[]} for k in ['cnn_svm','cnn_rf','cnn_knn','cnn_xgb']}
+    
+    futures = []
     for fold, (tr, te) in enumerate(skf.split(X_raw, y)):
-        np.random.seed(SEED + fold)
-        tf.random.set_seed(SEED + fold)
-        sc        = MinMaxScaler()
-        Xtr_s     = sc.fit_transform(X_raw[tr]).astype(np.float32)
-        Xte_s     = sc.transform(X_raw[te]).astype(np.float32)
-        Xtr_aug, ytr_aug = augment(Xtr_s, y[tr])
-        Xtr_aug_r = Xtr_aug.reshape(-1, N_FEATURES, 1)
-        Xtr_r     = Xtr_s.reshape(-1, N_FEATURES, 1)
-        Xte_r     = Xte_s.reshape(-1, N_FEATURES, 1)
-        cnn = build_cnn(cnn_act=cnn_act, fc_act='relu',
-                        filters_1=filters_1, filters_2=filters_2,
-                        kernel_size=kernel_size, dropout=dropout,
-                        dense_units=dense_units, lr=lr)
-        cnn.fit(Xtr_aug_r, ytr_aug, validation_split=0.10,
-                epochs=500, batch_size=BATCH_SIZE,
-                callbacks=[ES, LR_REDUCE], verbose=0)
-        ext  = keras.Model(inputs=cnn.input, outputs=cnn.get_layer('fc').output)
-        Ftr  = ext(Xtr_r, training=False).numpy()
-        Fte  = ext(Xte_r, training=False).numpy()
-        K.clear_session()
-        clfs = {
-            'cnn_svm': SVC(kernel='rbf', random_state=SEED),
-            'cnn_rf' : RandomForestClassifier(n_estimators=n_rf, random_state=SEED, n_jobs=-1),
-            'cnn_knn': KNeighborsClassifier(n_neighbors=k_knn),
-            'cnn_xgb': XGBClassifier(n_estimators=200, learning_rate=0.1,
-                                      max_depth=4, use_label_encoder=False,
-                                      eval_metric='mlogloss', random_state=SEED,
-                                      verbosity=0, tree_method='hist', device='cuda'),
-        }
-        fold_accs = {}
-        for name, clf in clfs.items():
-            clf.fit(Ftr, y[tr])
-            preds = clf.predict(Fte)
-            acc   = round(accuracy_score(y[te], preds), 3)
-            res[name]['accs'].append(acc)
-            res[name]['true'].extend(y[te])
-            res[name]['pred'].extend(preds)
-            fold_accs[name] = acc
+        futures.append(_cv_shared_fold_remote.remote(
+            fold, tr, te, X_raw_id, y_id, cnn_act, k_knn, n_rf, 
+            filters_1, filters_2, kernel_size, dropout, dense_units, lr, SEED, BATCH_SIZE
+        ))
+        
+    results = ray.get(futures)
+    for fold, fold_res in enumerate(results):
+        fold_accs, fold_preds, y_te = fold_res
         print(f'  Fold {fold+1:2d}: '
               f'SVM={fold_accs["cnn_svm"]:.3f}  '
               f'RF={fold_accs["cnn_rf"]:.3f}  '
-              f'kNN={fold_accs["cnn_knn"]:.3f}')
+              f'kNN={fold_accs["cnn_knn"]:.3f}  '
+              f'XGB={fold_accs["cnn_xgb"]:.3f}')
+        for name in res:
+            res[name]['accs'].append(fold_accs[name])
+            res[name]['true'].extend(y_te)
+            res[name]['pred'].extend(fold_preds[name])
+            
     _elapsed = time.time() - _t0
     TIMING['Shared_CNN_hybrid'] = _elapsed
     print(f'  -- Total hybrid time: {_elapsed:.1f}s ({_elapsed/60:.1f} min)')
@@ -637,29 +733,46 @@ def cv_shared_hybrid(cnn_act='relu', k_knn=5, n_rf=200,
         log(f'  {name}: avg={avg:.3f}')
     return res
 
+@ray.remote(num_gpus=1)
+def _cv_xgboost_fold_remote(fold, tr, te, X_raw_data, y_data, seed):
+    import numpy as np
+    from sklearn.preprocessing import MinMaxScaler
+    from sklearn.metrics import accuracy_score
+    from xgboost import XGBClassifier
+    
+    np.random.seed(seed + fold)
+    sc  = MinMaxScaler()
+    Xtr = sc.fit_transform(X_raw_data[tr])
+    Xte = sc.transform(X_raw_data[te])
+    clf = XGBClassifier(
+        n_estimators=200, learning_rate=0.1,
+        max_depth=4, eval_metric='mlogloss',
+        random_state=seed, verbosity=0,
+        tree_method='hist', device='cuda'
+    )
+    clf.fit(Xtr, y_data[tr])
+    preds = clf.predict(Xte)
+    acc   = round(accuracy_score(y_data[te], preds), 3)
+    return acc, (y_data[te] if True else None), (preds if True else None)
 
 def cv_xgboost(collect_preds=False):
-    print('\\n[XGBoost - standalone]')
+    print('\n[XGBoost - standalone]')
     skf = StratifiedKFold(n_splits=N_SPLITS, shuffle=True, random_state=SEED)
     accs, all_true, all_pred = [], [], []
+    
+    futures = []
     for fold, (tr, te) in enumerate(skf.split(X_raw, y)):
-        np.random.seed(SEED + fold)
-        sc  = MinMaxScaler()
-        Xtr = sc.fit_transform(X_raw[tr])
-        Xte = sc.transform(X_raw[te])
-        clf = XGBClassifier(
-            n_estimators=200, learning_rate=0.1,
-            max_depth=4, eval_metric='mlogloss',
-            random_state=SEED, verbosity=0,
-            tree_method='hist', device='cuda'
-        )
-        clf.fit(Xtr, y[tr])
-        preds = clf.predict(Xte)
-        acc   = round(accuracy_score(y[te], preds), 3)
+        futures.append(_cv_xgboost_fold_remote.remote(fold, tr, te, X_raw_id, y_id, SEED))
+        
+    results = ray.get(futures)
+    for fold, res in enumerate(results):
+        acc, t_labels, p_labels = res
         accs.append(acc)
         if collect_preds:
-            all_true.extend(y[te]); all_pred.extend(preds)
+            all_true.extend(t_labels)
+            all_pred.extend(p_labels)
         print(f'  Fold {fold+1:2d}: {acc:.3f}')
+        
     print(f'  -- Average: {np.mean(accs):.3f}')
     if collect_preds:
         return accs, np.array(all_true), np.array(all_pred)
@@ -1112,9 +1225,7 @@ print(f'Total planned evaluations: {PSO_PARTICLES * PSO_ITERATIONS}')
 print(f'Checkpoint path: {PSO_CKPT_PATH}')
 print()
 
-ray.init(num_gpus=3, ignore_reinit_error=True)
-X_raw_id = ray.put(X_raw)
-y_id = ray.put(y)
+# ray.init and object references moved to imports section
 
 pbar = tqdm(range(start_iter, PSO_ITERATIONS), desc="PSO Search Iterations")
 for it in pbar:
