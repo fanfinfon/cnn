@@ -77,7 +77,10 @@ fi
 
 # 2. Check if GPU is visible and driver is healthy at host level
 if ! nvidia-smi > /dev/null 2>&1; then
-    error "nvidia-smi execution failed. The GPU is not visible to the system, or the host NVIDIA driver/CUDA stack is broken."
+    log "Unprivileged nvidia-smi failed. Attempting with sudo..."
+    if ! sudo nvidia-smi > /dev/null 2>&1; then
+        error "nvidia-smi execution failed even with sudo. The GPU is not visible to the system, or the host NVIDIA driver/CUDA stack is broken."
+    fi
 fi
 
 # 3. Test if Docker is correctly configured to pass GPUs to containers
