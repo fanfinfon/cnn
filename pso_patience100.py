@@ -475,12 +475,15 @@ LR_REDUCE = keras.callbacks.ReduceLROnPlateau(
 
 
 def rbf_activation(x):
+    from tensorflow.keras import backend as K
     return K.exp(-K.square(x))
 
 
 def build_cnn(cnn_act='relu', fc_act='linear',
               filters_1=32, filters_2=64, kernel_size=3,
               dropout=0.3, dense_units=64, lr=1e-3):
+    from tensorflow import keras
+    from tensorflow.keras import layers, regularizers
     inp = keras.Input(shape=(N_FEATURES, 1))
     x = layers.Conv1D(filters_1, kernel_size=kernel_size, padding='same', activation=None, name='conv1')(inp)
     x = layers.BatchNormalization()(x)
@@ -507,6 +510,7 @@ def build_cnn(cnn_act='relu', fc_act='linear',
 
 
 def augment(X, y_arr, noise_std=0.02, copies=2):
+    import numpy as np
     parts_X, parts_y = [X], [y_arr]
     for _ in range(copies):
         noise = np.random.normal(0, noise_std, X.shape).astype(np.float32)
